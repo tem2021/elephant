@@ -42,9 +42,13 @@ def mem_mapping(
                 if k == np:
                     for m in range(1, i):   # split the read ports
                         dp[i][j][k] = update(dp[i][j][k], (dp[m][j][k][0] + dp[i - m][j][k][0], f"split_r {m}"))
+                    for m in range(1, j):   # split the write ports
+                        dp[i][j][k] = update(dp[i][j][k], (dp[i][m][k][0] + dp[i][j - m][k][0], f"split_w {m}"))
                 else:
                     for m in range(1, i):   # split the read ports
                         dp[i][j][k] = update(dp[i][j][k], (dp[m][j][k][0] + dp[i - m][j][k][0], f"split_r {m}"))
+                    for m in range(1, j):   # split the write ports
+                        dp[i][j][k] = update(dp[i][j][k], (dp[i][m][k][0] + dp[i][j - m][k][0], f"split_w {m}"))
                     if i > 0:   # cast a read port to a read-write port
                         dp[i][j][k] = update(dp[i][j][k], (dp[i - 1][j][k + 1][0], "cast_r"))
                     if j > 0:   # cast a write port to a read-write port
@@ -91,6 +95,10 @@ def mem_mapping(
             m = int(choice.split(" ")[1])
             reconstruct_recursive(physical_mems, dp, rps[:m], wps, rwps, m, j, k)
             reconstruct_recursive(physical_mems, dp, rps[m:], wps, rwps, i - m, j, k)
+        elif choice.startswith("split_w"):
+            m = int(choice.split(" ")[1])
+            reconstruct_recursive(physical_mems, dp, rps, wps[:m], rwps, i, m, k)
+            reconstruct_recursive(physical_mems, dp, rps, wps[m:], rwps, i, j - m, k)
         elif choice == "cast_r":
             new_rwp = AbstractMem.ReadWritePort(
                 addr=rps[-1].addr,
@@ -328,6 +336,131 @@ def test_4r2w(tech: list[dict[str, Any]], verbose: bool = False):
         print(e)
 
 
+def test_4r4w(tech: list[dict[str, Any]], verbose: bool = False):
+    print("---- test_4r4w ----")
+    print(f"tech available: {[mem['name'] for mem in tech]}")
+
+    rps = [
+        AbstractMem.ReadPort(
+            addr=pyrtl.WireVector(10, name=f"addr_r{i}"),
+            data=pyrtl.WireVector(32, name=f"data_r{i}"),
+            en=1,
+        )
+        for i in range(4)
+    ]
+    wps = [
+        AbstractMem.WritePort(
+            addr=pyrtl.WireVector(10, name=f"addr_w{i}"),
+            data=pyrtl.WireVector(32, name=f"data_w{i}"),
+            en=1,
+        )
+        for i in range(4)
+    ]
+    mem = AbstractMem(
+        width=32,
+        height=1024,
+        name="test_4r4w",
+        read_ports=rps,
+        write_ports=wps,
+    )
+    try:
+        physical_mems = mem_mapping(mem, tech)
+        for physical_mem in physical_mems:
+            if verbose:
+                print(physical_mem)
+            else:
+                print(f"{physical_mem.name}")
+    except ValueError as e:
+        print(e)
+
+
+def test_4r4w_pyrtl_elab(verbose: bool = False):
+    print("---- test_4r4w_pyrtl_elab ----")
+    pyrtl.reset_working_block()
+
+    rps = [
+        AbstractMem.ReadPort(
+            addr=pyrtl.Input(10, name=f"addr_r{i}"),
+            data=pyrtl.Output(32, name=f"data_r{i}"),
+            en=pyrtl.Const(1, bitwidth=1),
+        )
+        for i in range(4)
+    ]
+    wps = [
+        AbstractMem.WritePort(
+            addr=pyrtl.Input(10, name=f"addr_w{i}"),
+            data=pyrtl.Input(32, name=f"data_w{i}"),
+            en=pyrtl.Const(1, bitwidth=1),
+        )
+        for i in range(4)
+    ]
+    mem = AbstractMem(
+        width=32,
+        height=1024,
+        name="test_4r4w_elab",
+        read_ports=rps,
+        write_ports=wps,
+        forward=True,
+        asynchronous=True,
+    )
+    mem.to_pyrtl(pyrtl.working_block())
+
+    # Should not error due to port limits.
+    pyrtl.working_block().sanity_check()
+    if verbose:
+        print(pyrtl.working_block())
+
+
+def test_4w4r_same_addr_multiwrite_semantics():
+    print("---- test_4w4r_same_addr_multiwrite_semantics ----")
+    pyrtl.reset_working_block()
+
+    r0_addr = pyrtl.Input(10, name="r0_addr")
+    r0_data = pyrtl.Output(32, name="r0_data")
+    r0_en = pyrtl.Input(1, name="r0_en")
+
+    w_addrs = [pyrtl.Input(10, name=f"w{i}_addr") for i in range(4)]
+    w_datas = [pyrtl.Input(32, name=f"w{i}_data") for i in range(4)]
+    w_ens = [pyrtl.Input(1, name=f"w{i}_en") for i in range(4)]
+
+    mem = AbstractMem(
+        width=32,
+        height=1024,
+        name="test_4w4r_sem",
+        read_ports=[AbstractMem.ReadPort(addr=r0_addr, data=r0_data, en=r0_en)],
+        write_ports=[
+            AbstractMem.WritePort(addr=w_addrs[i], data=w_datas[i], en=w_ens[i])
+            for i in range(4)
+        ],
+        forward=True,
+        asynchronous=False,
+    )
+    mem.to_pyrtl(pyrtl.working_block())
+    pyrtl.working_block().sanity_check()
+
+    sim = pyrtl.Simulation()
+
+    # Cycle 0: write two ports to same address 5; higher index wins (port 3).
+    inputs0 = {"r0_en": 1, "r0_addr": 5}
+    for i in range(4):
+        inputs0[f"w{i}_addr"] = 0
+        inputs0[f"w{i}_data"] = 0
+        inputs0[f"w{i}_en"] = 0
+    inputs0["w0_addr"], inputs0["w0_data"], inputs0["w0_en"] = 5, 0x11111111, 1
+    inputs0["w3_addr"], inputs0["w3_data"], inputs0["w3_en"] = 5, 0x33333333, 1
+    sim.step(inputs0)
+
+    # Cycle 1: read same address; expect port 3's data.
+    inputs1 = {"r0_en": 1, "r0_addr": 5}
+    for i in range(4):
+        inputs1[f"w{i}_addr"] = 0
+        inputs1[f"w{i}_data"] = 0
+        inputs1[f"w{i}_en"] = 0
+    sim.step(inputs1)
+    got = sim.inspect("r0_data")
+    assert got == 0x33333333, f"expected 0x33333333, got {hex(got)}"
+
+
 if __name__ == "__main__":
     import json
     with open("test/mem_tech.json", "r") as f:
@@ -358,4 +491,16 @@ if __name__ == "__main__":
     test_4r2w(tech["xilinx"])
     print('===================\n')
     test_4r2w(tech["pyrtl"])
+    print('===================\n')
+
+    test_4r4w(tech["xilinx"])
+    print('===================\n')
+    test_4r4w(tech["pyrtl"])
+    print('===================\n')
+
+    # elaboration sanity check (PyRTL lowering)
+    test_4r4w_pyrtl_elab()
+    print('===================\n')
+
+    test_4w4r_same_addr_multiwrite_semantics()
     print('===================\n')

@@ -284,14 +284,8 @@ class AbstractMem:
 
     def to_pyrtl(self, block):
         addrwidth = int(log2(self.height))
-        mem = pyrtl.MemBlock(bitwidth=self.width,
-                             addrwidth=addrwidth,
-                             name=self.name,
-                             #max_read_ports=len(self.read_ports),
-                             max_write_ports=len(self.write_ports),
-                             asynchronous=self.asynchronous,
-                             block=block,
-                             )
+        if self.read_write_ports:
+            raise Exception("Error, to_pyrtl does not yet support read_write_ports")
 
         def clz(x):
             def f(accum, x):
@@ -306,36 +300,163 @@ class AbstractMem:
         def count_ones(w):
             return reduce(pyrtl.corecircuits._basic_add, w, pyrtl.Const(0, len(w)))
 
-        # Write Port
-        for write_port in self.write_ports:
-            if not isinstance(write_port, AbstractMem.WritePort):
-                raise Exception(f"Error, invalid write port: {write_port}")
+        def _as_en(en):
+            if en is None:
+                return pyrtl.Const(1, bitwidth=1)
+            if isinstance(en, pyrtl.WireVector):
+                return en
+            return pyrtl.as_wires(en, bitwidth=1)
 
-            w_addr, w_data, w_en, w_mask = write_port.addr,\
-                                           write_port.data,\
-                                           write_port.en,\
-                                           write_port.mask
+        def _build_masked_write_data(mem_for_read, w_addr, w_data, w_en, w_mask):
+            if w_mask is None:
+                return w_data
 
-            if w_mask is not None:
-                og_data = mem[w_addr]
+            og_data = mem_for_read[w_addr]
+            if w_mask.offset is False:
+                return pyrtl.concat_list(
+                    [pyrtl.select(w_en & w_mask.mask[i], w_data[i], og_data[i])
+                     for i in range(self.width)]
+                )
 
-                if w_mask.offset == False:
-                    mask_data = pyrtl.concat_list(
-                            [pyrtl.select(w_en & w_mask.mask[i], w_data[i], og_data[i])
-                             for i in range(self.width)])
-                elif w_mask.offset == True:
-                    num_0s = clz(w_mask.mask)
-                    data_shifted = pyrtl.WireVector(self.width)
-                    data_shifted <<= pyrtl.shift_left_logical(w_data, num_0s)
-                    mask_data = pyrtl.concat_list(
-                            [pyrtl.select(w_en & w_mask.mask[i], data_shifted[i], og_data[i])
-                             for i in range(self.width)])
+            num_0s = clz(w_mask.mask)
+            data_shifted = pyrtl.WireVector(self.width)
+            data_shifted <<= pyrtl.shift_left_logical(w_data, num_0s)
+            return pyrtl.concat_list(
+                [pyrtl.select(w_en & w_mask.mask[i], data_shifted[i], og_data[i])
+                 for i in range(self.width)]
+            )
 
-            final_data = w_data if w_mask is None else mask_data
-            if w_en is None:
-                mem[w_addr] <<= final_data
-            else:
+        def _priority_forward(addr_r, base_data, write_infos):
+            # write_infos: list[tuple[WireVector en, WireVector addr, WireVector data]]
+            rdata = base_data
+            for (wen, waddr, wdata) in write_infos:
+                rdata = pyrtl.select(wen & (addr_r == waddr), wdata, rdata)
+            return rdata
+
+        if len(self.write_ports) <= 1:
+            mem = pyrtl.MemBlock(
+                bitwidth=self.width,
+                addrwidth=addrwidth,
+                name=self.name,
+                max_read_ports=None,
+                max_write_ports=None,
+                asynchronous=self.asynchronous,
+                block=block,
+            )
+
+            # Write Port
+            for write_port in self.write_ports:
+                if not isinstance(write_port, AbstractMem.WritePort):
+                    raise Exception(f"Error, invalid write port: {write_port}")
+
+                w_addr, w_data, w_en, w_mask = (
+                    write_port.addr,
+                    write_port.data,
+                    _as_en(write_port.en),
+                    write_port.mask,
+                )
+                final_data = _build_masked_write_data(mem, w_addr, w_data, w_en, w_mask)
                 mem[w_addr] <<= pyrtl.MemBlock.EnabledWrite(final_data, enable=w_en)
+
+            # Read Ports
+            for read_port in self.read_ports:
+                if not isinstance(read_port, AbstractMem.ReadPort):
+                    raise Exception(f"Error, invalid read port: {read_port}")
+
+                addr, data, en = read_port.addr, read_port.data, _as_en(read_port.en)
+
+                if self.asynchronous:
+                    addr_r = pyrtl.WireVector(addrwidth)
+                else:
+                    addr_r = pyrtl.Register(addrwidth)
+
+                if self.asynchronous:
+                    with pyrtl.conditional_assignment:
+                        with en:
+                            addr_r |= addr
+                else:
+                    with pyrtl.conditional_assignment:
+                        with en:
+                            addr_r.next |= addr
+
+                base_rdata = mem[addr_r]
+                rdata = base_rdata
+                if self.forward and self.write_ports:
+                    wp = self.write_ports[0]
+                    w_addr, w_data, w_en = wp.addr, wp.data, _as_en(wp.en)
+                    rdata = pyrtl.select(addr_r == w_addr, w_data, base_rdata)
+
+                final_rdata = rdata
+
+                if self.latch_last_read:
+                    llr_en = pyrtl.Register(1)
+                    llr_data = pyrtl.Register(self.width)
+
+                    llr_en.next <<= en
+                    llr_data.next <<= pyrtl.select(llr_en, final_rdata, llr_data)
+
+                    data <<= llr_data
+                else:
+                    data <<= final_rdata
+
+            return
+
+        # Multi-write-port lowering (Figure 4 write-port rule): bank per write port + MRB selector.
+        num_banks = len(self.write_ports)
+        bankid_width = max(1, (num_banks - 1).bit_length())
+
+        banks = [
+            pyrtl.MemBlock(
+                bitwidth=self.width,
+                addrwidth=addrwidth,
+                name=f"{self.name}_bank{i}",
+                max_read_ports=None,
+                max_write_ports=1,
+                asynchronous=self.asynchronous,
+                block=block,
+            )
+            for i in range(num_banks)
+        ]
+
+        mrb = pyrtl.MemBlock(
+            bitwidth=bankid_width,
+            addrwidth=addrwidth,
+            name=f"{self.name}_mrb",
+            max_read_ports=None,
+            max_write_ports=None,
+            asynchronous=self.asynchronous,
+            block=block,
+        )
+
+        # Enforce deterministic same-address multiwrite: higher index wins.
+        write_infos: list[tuple[pyrtl.WireVector, pyrtl.WireVector, pyrtl.WireVector, AbstractMem.Mask | None]] = []
+        for wp in self.write_ports:
+            if not isinstance(wp, AbstractMem.WritePort):
+                raise Exception(f"Error, invalid write port: {wp}")
+            write_infos.append((_as_en(wp.en), wp.addr, wp.data, wp.mask))
+
+        eff_wens: list[pyrtl.WireVector] = []
+        for i, (wen_i, waddr_i, _wdata_i, _wmask_i) in enumerate(write_infos):
+            higher_same_addr = pyrtl.Const(0, bitwidth=1)
+            for j in range(i + 1, num_banks):
+                wen_j, waddr_j, _wdata_j, _wmask_j = write_infos[j]
+                higher_same_addr = higher_same_addr | (wen_j & (waddr_j == waddr_i))
+            eff_wens.append(wen_i & ~higher_same_addr)
+
+        # Writes to banks and MRB
+        for i, (eff_en, (_wen_i, waddr_i, wdata_i, wmask_i)) in enumerate(zip(eff_wens, write_infos)):
+            final_data = _build_masked_write_data(banks[i], waddr_i, wdata_i, eff_en, wmask_i)
+            banks[i][waddr_i] <<= pyrtl.MemBlock.EnabledWrite(final_data, enable=eff_en)
+            mrb[waddr_i] <<= pyrtl.MemBlock.EnabledWrite(pyrtl.Const(i, bitwidth=bankid_width), enable=eff_en)
+
+        def _pad_to_pow2(items: list[pyrtl.WireVector]) -> list[pyrtl.WireVector]:
+            n = len(items)
+            if n <= 1:
+                return items
+            target = 1 << ((n - 1).bit_length())
+            if target == n:
+                return items
+            return items + [items[-1]] * (target - n)
 
         # Read Ports
         for read_port in self.read_ports:
@@ -362,12 +483,20 @@ class AbstractMem:
                     with en:
                         addr_r.next |= addr
 
+            en = _as_en(en)
+            mrb_sel = mrb[addr_r]
+            bank_datas = [b[addr_r] for b in banks]
+            bank_datas = _pad_to_pow2(bank_datas)
+            base_rdata = pyrtl.mux(mrb_sel, *bank_datas)
+
+            rdata = base_rdata
             if self.forward:
-                rdata = pyrtl.select(addr_r == w_addr,
-                                     w_data,
-                                     mem[addr_r])
-            else:
-                rdata = mem[addr_r]
+                # Apply forwarding against effective writes in priority order (low -> high).
+                fwd_infos: list[tuple[pyrtl.WireVector, pyrtl.WireVector, pyrtl.WireVector]] = []
+                for (eff_en, (_wen_i, waddr_i, wdata_i, wmask_i)), bank in zip(zip(eff_wens, write_infos), banks):
+                    fwd_data = _build_masked_write_data(bank, waddr_i, wdata_i, eff_en, wmask_i)
+                    fwd_infos.append((eff_en, waddr_i, fwd_data))
+                rdata = _priority_forward(addr_r, base_rdata, fwd_infos)
 
             #if mask is not None:
             #    r_mask = mask.mask
